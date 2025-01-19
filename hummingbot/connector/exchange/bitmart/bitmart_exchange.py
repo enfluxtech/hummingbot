@@ -130,18 +130,14 @@ class BitmartExchange(ExchangePyBase):
         return is_time_synchronizer_related
 
     def _is_order_not_found_during_status_update_error(self, status_update_exception: Exception) -> bool:
-        # TODO: implement this method correctly for the connector
-        # The default implementation was added when the functionality to detect not found orders was introduced in the
-        # ExchangePyBase class. Also fix the unit test test_lost_order_removed_if_not_found_during_order_status_update
-        # when replacing the dummy implementation
-        return False
+        return str(CONSTANTS.ORDER_NOT_EXIST_ERROR_CODE) in str(
+            status_update_exception
+        ) and CONSTANTS.ORDER_NOT_EXIST_MESSAGE in str(status_update_exception)
 
     def _is_order_not_found_during_cancelation_error(self, cancelation_exception: Exception) -> bool:
-        # TODO: implement this method correctly for the connector
-        # The default implementation was added when the functionality to detect not found orders was introduced in the
-        # ExchangePyBase class. Also fix the unit test test_cancel_order_not_found_in_the_exchange when replacing the
-        # dummy implementation
-        return False
+        return str(CONSTANTS.UNKNOWN_ORDER_ERROR_CODE) in str(
+            cancelation_exception
+        ) and CONSTANTS.UNKNOWN_ORDER_MESSAGE in str(cancelation_exception)
 
     def _create_web_assistants_factory(self) -> WebAssistantsFactory:
         return web_utils.build_api_factory(
@@ -187,13 +183,12 @@ class BitmartExchange(ExchangePyBase):
                            order_type: OrderType,
                            price: Decimal,
                            **kwargs) -> Tuple[str, float]:
-
         api_params = {"symbol": await self.exchange_symbol_associated_to_pair(trading_pair),
                       "side": trade_type.name.lower(),
                       "type": "limit",
                       "size": f"{amount:f}",
                       "price": f"{price:f}",
-                      "clientOrderId": order_id,
+                      "client_order_id": order_id,
                       }
         order_result = await self._api_post(
             path_url=CONSTANTS.CREATE_ORDER_PATH_URL,
@@ -205,7 +200,8 @@ class BitmartExchange(ExchangePyBase):
 
     async def _place_cancel(self, order_id: str, tracked_order: InFlightOrder):
         api_params = {
-            "clientOrderId": order_id,
+            "symbol": await self.exchange_symbol_associated_to_pair(tracked_order.trading_pair),
+            "client_order_id": order_id,
         }
         cancel_result = await self._api_post(
             path_url=CONSTANTS.CANCEL_ORDER_PATH_URL,
@@ -287,19 +283,20 @@ class BitmartExchange(ExchangePyBase):
             del self._account_balances[asset_name]
 
     async def _request_order_update(self, order: InFlightOrder) -> Dict[str, Any]:
-        return await self._api_get(
+        return await self._api_post(
             path_url=CONSTANTS.GET_ORDER_DETAIL_PATH_URL,
-            params={"order_id": order.exchange_order_id},
+            data={"orderId": order.exchange_order_id},
             is_auth_required=True)
 
     async def _request_order_fills(self, order: InFlightOrder) -> Dict[str, Any]:
         return await self._api_request(
-            method=RESTMethod.GET,
+            method=RESTMethod.POST,
             path_url=CONSTANTS.GET_TRADE_DETAIL_PATH_URL,
-            params={
-                "symbol": await self.exchange_symbol_associated_to_pair(order.trading_pair),
-                "order_id": await order.get_exchange_order_id()},
-            is_auth_required=True)
+            data={
+                "orderId": await order.get_exchange_order_id()
+            },
+            is_auth_required=True
+        )
 
     async def _all_trade_updates_for_order(self, order: InFlightOrder) -> List[TradeUpdate]:
         trade_updates = []
@@ -326,25 +323,25 @@ class BitmartExchange(ExchangePyBase):
 
     def _create_order_fill_updates(self, order: InFlightOrder, fill_update: Dict[str, Any]) -> List[TradeUpdate]:
         updates = []
-        fills_data = fill_update["data"]["trades"]
+        fills_data = fill_update["data"]
 
         for fill_data in fills_data:
             fee = TradeFeeBase.new_spot_fee(
                 fee_schema=self.trade_fee_schema(),
                 trade_type=order.trade_type,
-                percent_token=fill_data["fee_coin_name"],
-                flat_fees=[TokenAmount(amount=Decimal(fill_data["fees"]), token=fill_data["fee_coin_name"])]
+                percent_token=fill_data["feeCoinName"],
+                flat_fees=[TokenAmount(amount=Decimal(fill_data["fee"]), token=fill_data["feeCoinName"])]
             )
             trade_update = TradeUpdate(
-                trade_id=str(fill_data["detail_id"]),
+                trade_id=str(fill_data["tradeId"]),
                 client_order_id=order.client_order_id,
-                exchange_order_id=str(fill_data["order_id"]),
+                exchange_order_id=str(fill_data["orderId"]),
                 trading_pair=order.trading_pair,
                 fee=fee,
                 fill_base_amount=Decimal(fill_data["size"]),
-                fill_quote_amount=Decimal(fill_data["size"]) * Decimal(fill_data["price_avg"]),
-                fill_price=Decimal(fill_data["price_avg"]),
-                fill_timestamp=int(fill_data["create_time"]) * 1e-3,
+                fill_quote_amount=Decimal(fill_data["size"]) * Decimal(fill_data["price"]),
+                fill_price=Decimal(fill_data["price"]),
+                fill_timestamp=int(fill_data["updateTime"]) * 1e-3,
             )
             updates.append(trade_update)
 
@@ -352,10 +349,10 @@ class BitmartExchange(ExchangePyBase):
 
     def _create_order_update(self, order: InFlightOrder, order_update: Dict[str, Any]) -> OrderUpdate:
         order_data = order_update["data"]
-        new_state = CONSTANTS.ORDER_STATE[order_data["status"]]
+        new_state = CONSTANTS.ORDER_STATE[order_data["state"]]
         update = OrderUpdate(
             client_order_id=order.client_order_id,
-            exchange_order_id=str(order_data["order_id"]),
+            exchange_order_id=str(order_data["orderId"]),
             trading_pair=order.trading_pair,
             update_timestamp=self.current_timestamp,
             new_state=new_state,
@@ -376,7 +373,7 @@ class BitmartExchange(ExchangePyBase):
                             fillable_order = self._order_tracker.all_fillable_orders.get(client_order_id)
                             updatable_order = self._order_tracker.all_updatable_orders.get(client_order_id)
 
-                            new_state = CONSTANTS.ORDER_STATE[each_event["state"]]
+                            new_state = CONSTANTS.ORDER_STATE[each_event["order_state"]]
                             event_timestamp = int(each_event["ms_t"]) * 1e-3
 
                             if fillable_order is not None:
@@ -418,7 +415,7 @@ class BitmartExchange(ExchangePyBase):
 
     def _initialize_trading_pair_symbols_from_exchange_info(self, exchange_info: Dict[str, Any]):
         mapping = bidict()
-        for symbol_data in filter(bitmart_utils.is_exchange_information_valid, exchange_info["data"]["symbols"]):
+        for symbol_data in exchange_info["data"]["symbols"]:
             mapping[symbol_data["symbol"]] = combine_to_hb_trading_pair(base=symbol_data["base_currency"],
                                                                         quote=symbol_data["quote_currency"])
         self._set_trading_pair_symbol_map(mapping)
@@ -433,4 +430,4 @@ class BitmartExchange(ExchangePyBase):
             params=params
         )
 
-        return float(resp_json["data"]["tickers"][0]["last_price"])
+        return float(resp_json["data"]["last"])
